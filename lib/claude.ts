@@ -94,13 +94,14 @@ Return ONLY the JSON object.`;
     model: "claude-sonnet-4-20250514",
     max_tokens: 1500,
     system: SYSTEM_PROMPT,
-    tools: [{ type: "web_search_20250305", name: "web_search" }],
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    tools: [{ type: "web_search_20250305", name: "web_search" } as any],
     messages: [{ role: "user", content: userMessage }],
   });
 
   const text = response.content
     .filter((b): b is Anthropic.TextBlock => b.type === "text")
-    .map((b) => b.text)
+    .map((b: Anthropic.TextBlock) => b.text)
     .join("");
 
   const clean = text.replace(/```json|```/g, "").trim();
@@ -131,7 +132,7 @@ Return ONLY a JSON array of 3 strings.`,
 
   const text = response.content
     .filter((b): b is Anthropic.TextBlock => b.type === "text")
-    .map((b) => b.text)
+    .map((b: Anthropic.TextBlock) => b.text)
     .join("");
 
   return JSON.parse(text.replace(/```json|```/g, "").trim()) as string[];
