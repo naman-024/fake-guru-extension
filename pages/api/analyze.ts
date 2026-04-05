@@ -6,6 +6,14 @@ import {
   getVideoTitleFromApi,
 } from "@/lib/youtube";
 
+function isValidChannelId(id: string | null | undefined): boolean {
+  if (!id) return false;
+  // Reject domains, IPs, full URLs — only allow plain IDs or handles
+  if (id.includes(".") || id.includes("/") || id.includes(":")) return false;
+  if (id.length < 2) return false;
+  return true;
+}
+
 export default async function handler(
   req: NextApiRequest,
   res: NextApiResponse<AnalysisResult | { error: string }>
@@ -19,25 +27,34 @@ export default async function handler(
     title?: string;
   };
 
-  if (!videoId) {
+  if (!videoId || typeof videoId !== "string") {
     return res.status(400).json({ error: "videoId is required" });
   }
 
-  // Auto-resolve channelId from the videoId if the extension couldn't detect it
+  // Sanitize channelId — reject garbage like "www.youtube.com"
+  if (!isValidChannelId(channelId)) {
+    channelId = null;
+  }
+
+  // If still null, resolve from videoId via YouTube API
   if (!channelId) {
+    console.log(`[analyze] channelId missing or invalid, resolving from videoId ${videoId}`);
     channelId = await getChannelIdFromVideo(videoId);
   }
 
   if (!channelId) {
     return res.status(400).json({
-      error: "Could not determine channelId. Make sure YOUTUBE_API_KEY is set in Vercel environment variables.",
+      error:
+        "Could not determine channelId. Ensure YOUTUBE_API_KEY is set in Vercel environment variables.",
     });
   }
 
-  // Auto-resolve title if blank
+  // Resolve blank title from YouTube API
   if (!title || title.trim() === "") {
     title = await getVideoTitleFromApi(videoId);
   }
+
+  console.log(`[analyze] videoId=${videoId} channelId=${channelId} title="${title}"`);
 
   try {
     const transcripts = await fetchTranscriptsForChannel(channelId, videoId, title);

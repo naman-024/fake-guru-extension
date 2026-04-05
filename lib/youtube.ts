@@ -36,8 +36,22 @@ export async function getChannelVideos(
 ): Promise<{ videoId: string; title: string }[]> {
   const apiKey = process.env.YOUTUBE_API_KEY;
   if (!apiKey) throw new Error("YOUTUBE_API_KEY not set");
+
+  // If it looks like a handle (@name) or custom name, resolve to a real channelId first
+  let resolvedId = channelId;
+  if (!channelId.startsWith("UC")) {
+    const handle = channelId.startsWith("@") ? channelId : `@${channelId}`;
+    const lookupRes = await fetch(
+      `https://www.googleapis.com/youtube/v3/channels?part=id&forHandle=${encodeURIComponent(handle)}&key=${apiKey}`
+    );
+    if (lookupRes.ok) {
+      const lookupData = (await lookupRes.json()) as { items?: { id: string }[] };
+      resolvedId = lookupData.items?.[0]?.id ?? channelId;
+    }
+  }
+
   const res = await fetch(
-    `https://www.googleapis.com/youtube/v3/search?part=snippet&channelId=${channelId}&type=video&order=date&maxResults=${maxResults}&key=${apiKey}`
+    `https://www.googleapis.com/youtube/v3/search?part=snippet&channelId=${resolvedId}&type=video&order=date&maxResults=${maxResults}&key=${apiKey}`
   );
   if (!res.ok) throw new Error(`YouTube API error: ${res.status}`);
   const data = (await res.json()) as {
