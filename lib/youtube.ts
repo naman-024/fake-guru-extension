@@ -72,8 +72,22 @@ export async function getTranscript(videoId: string): Promise<string> {
         { headers: { "x-api-key": apiKey } }
       );
       if (res.ok) {
-        const data = (await res.json()) as { content: string };
-        if (data.content) return data.content;
+        const data = await res.json() as {
+          content?: string | { text: string }[] | unknown;
+        };
+        if (data.content) {
+          // Supadata can return a plain string OR an array of segment objects
+          if (typeof data.content === "string") return data.content;
+          if (Array.isArray(data.content)) {
+            return data.content
+              .map((seg: unknown) =>
+                typeof seg === "string" ? seg :
+                (seg as { text?: string })?.text ?? ""
+              )
+              .join(" ")
+              .trim();
+          }
+        }
       }
     } catch (_) {}
   }

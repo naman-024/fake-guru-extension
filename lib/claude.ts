@@ -60,9 +60,16 @@ async function searchWeb(query: string): Promise<BraveResult[]> {
   }
 }
 
-async function gatherEvidence(transcripts: { text: string }[]): Promise<string> {
-  // Extract key claim topics from transcript snippet to search for
-  const snippet = transcripts[0]?.text?.slice(0, 800) ?? "";
+async function gatherEvidence(transcripts: { text: string | unknown }[]): Promise<string> {
+  // Coerce text to string — Supadata may return arrays of segment objects
+  const rawText = transcripts[0]?.text;
+  const textStr: string =
+    typeof rawText === "string" ? rawText :
+    Array.isArray(rawText) ? rawText.map((s: unknown) =>
+      typeof s === "string" ? s : (s as { text?: string })?.text ?? ""
+    ).join(" ") : String(rawText ?? "");
+
+  const snippet = textStr.slice(0, 800);
 
   // Pull 2 searches: general channel topic + fact-check angle
   const words = snippet.split(/\s+/).slice(0, 8).join(" ");
@@ -129,7 +136,12 @@ export async function analyzeCreator(
   const webEvidence = await gatherEvidence(transcripts);
 
   const transcriptBlock = transcripts
-    .map((t, i) => `=== VIDEO ${i + 1}: "${t.title}" ===\n${t.text.slice(0, 2500)}`)
+    .map((t, i) => {
+      const txt = typeof t.text === "string" ? t.text :
+        Array.isArray(t.text) ? (t.text as {text?:string}[]).map(s => s?.text ?? "").join(" ") :
+        String(t.text ?? "");
+      return `=== VIDEO ${i + 1}: "${t.title}" ===\n${txt.slice(0, 2500)}`;
+    })
     .join("\n\n");
 
   const userMessage = `Analyze these ${transcripts.length} videos from the same YouTube creator.
@@ -156,9 +168,27 @@ Return ONLY the JSON object.`;
   });
 
   const raw = completion.choices[0]?.message?.content ?? "{}";
-  const clean = raw.replace(/```json|```/g, "").trim();
 
-  const parsed = JSON.parse(clean) as AnalysisResult;
+  // Strip markdown fences, then extract the JSON object even if LLM adds text around it
+  const fenceStripped = raw.replace(/```json|```/g, "").trim();
+  const jsonMatch = fenceStripped.match(/\{[\s\S]*\}/);
+  const clean = jsonMatch ? jsonMatch[0] : fenceStripped;
+
+  let parsed: AnalysisResult;
+  try {
+    parsed = JSON.parse(clean) as AnalysisResult;
+  } catch {
+    throw new Error(`Groq returned non-JSON response. Raw: ${raw.slice(0, 200)}`);
+  }
+
+  // Ensure all expected fields exist and are the right type
+  parsed.verdict = parsed.verdict ?? "unverifiable";
+  parsed.bias_score = Number(parsed.bias_score ?? 0);
+  parsed.claims = Array.isArray(parsed.claims) ? parsed.claims : [];
+  parsed.comment = typeof parsed.comment === "string" ? parsed.comment : "";
+  parsed.rephrased_variants = Array.isArray(parsed.rephrased_variants) ? parsed.rephrased_variants : [];
+  parsed.sources = Array.isArray(parsed.sources) ? parsed.sources : [];
+  parsed.summary = typeof parsed.summary === "string" ? parsed.summary : "";
   parsed.videos_analyzed = transcripts.length;
   return parsed;
 }
@@ -186,6 +216,13 @@ Return ONLY a JSON array of 3 strings, nothing else.`,
   });
 
   const raw = completion.choices[0]?.message?.content ?? "[]";
-  const clean = raw.replace(/```json|```/g, "").trim();
-  return JSON.parse(clean) as string[];
+  const fenceStripped = raw.replace(/```json|```/g, "").trim();
+  const arrMatch = fenceStripped.match(/\[[\s\S]*\]/);
+  const clean = arrMatch ? arrMatch[0] : fenceStripped;
+  try {
+    const result = JSON.parse(clean);
+    return Array.isArray(result) ? result.map(String) : [];
+  } catch {
+    return [];
+  }
 }
