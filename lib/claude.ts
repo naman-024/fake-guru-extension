@@ -1,6 +1,9 @@
-import Anthropic from "@anthropic-ai/sdk";
+import Groq from "groq-sdk";
 
-const client = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
+const groq = new Groq({ apiKey: process.env.GROQ_API_KEY });
+
+// Best Groq model for reasoning tasks
+const MODEL = "llama-3.3-70b-versatile";
 
 export interface Claim {
   quote: string;
@@ -26,30 +29,74 @@ export interface AnalysisResult {
   videos_analyzed: number;
 }
 
-const SYSTEM_PROMPT = `You are a rigorous, evidence-based fact-checker focused on exposing misleading claims made by online "gurus" — people who sell courses, coaching, or advice, often using exaggerated success stories, false statistics, and manipulative tactics.
+// ── Brave Search for web evidence ────────────────────────────────────────────
+interface BraveResult {
+  title: string;
+  url: string;
+  description: string;
+}
 
-Your principles:
-- You are not politically biased — you follow evidence and data only
-- You attack claims, never the person
-- You acknowledge when content is accurate — do not invent problems
-- You cite real, verifiable sources
-- Tone: like a knowledgeable friend correcting misinformation, not a troll
+async function searchWeb(query: string): Promise<BraveResult[]> {
+  const apiKey = process.env.BRAVE_SEARCH_API_KEY;
+  if (!apiKey) return [];
 
-Your analysis tasks:
-1. Extract all specific factual claims: income figures, statistics, scientific assertions, historical facts, promises about results
-2. Detect cross-video patterns: contradictions between videos, escalating claims, changed stories
-3. Identify manipulation tactics: fake urgency, false scarcity, cherry-picked data, appeal to authority without credentials, lifestyle flexing as proof
-4. Use the web_search tool to verify the 3 most impactful claims
-5. Generate a YouTube comment under 280 characters that is firm, factual, and cites one key piece of evidence
+  try {
+    const res = await fetch(
+      `https://api.search.brave.com/res/v1/web/search?q=${encodeURIComponent(query)}&count=5`,
+      {
+        headers: {
+          "Accept": "application/json",
+          "X-Subscription-Token": apiKey,
+        },
+      }
+    );
+    if (!res.ok) return [];
+    const data = (await res.json()) as {
+      web?: { results?: { title: string; url: string; description: string }[] };
+    };
+    return data.web?.results ?? [];
+  } catch (_) {
+    return [];
+  }
+}
 
-bias_score guide (0-10):
-0-2: Mostly factual, minor spin
-3-4: Some exaggeration or selective framing
-5-6: Significant misleading claims
-7-8: Systematic misinformation pattern
-9-10: Deliberate deception, dangerous advice
+async function gatherEvidence(transcripts: { text: string }[]): Promise<string> {
+  // Extract key claim topics from transcript snippet to search for
+  const snippet = transcripts[0]?.text?.slice(0, 800) ?? "";
 
-Output ONLY valid JSON — no markdown fencing, no explanation before or after:
+  // Pull 2 searches: general channel topic + fact-check angle
+  const words = snippet.split(/\s+/).slice(0, 8).join(" ");
+  const [general, factCheck] = await Promise.all([
+    searchWeb(words),
+    searchWeb(`fact check ${words}`),
+  ]);
+
+  const all = [...general, ...factCheck].slice(0, 6);
+  if (!all.length) return "No web evidence retrieved.";
+
+  return all
+    .map((r, i) => `[${i + 1}] ${r.title}\n${r.url}\n${r.description}`)
+    .join("\n\n");
+}
+
+// ── System prompt ─────────────────────────────────────────────────────────────
+const SYSTEM_PROMPT = `You are a rigorous, evidence-based fact-checker focused on exposing misleading claims made by online "gurus" — people who sell courses, coaching, or advice using exaggerated success stories, false statistics, and manipulative tactics.
+
+Rules:
+- Follow evidence only — no political bias
+- Attack claims, never the person
+- Acknowledge when content is accurate — do not invent problems
+- Tone: firm, factual, polite — like a knowledgeable friend correcting misinformation
+
+Your tasks:
+1. Extract specific factual claims: income figures, statistics, scientific assertions, historical facts, promises about results
+2. Cross-reference the provided web evidence snippets to verify or dispute each claim
+3. Detect patterns across all videos: contradictions, escalating claims, fake urgency, cherry-picked data, appeal to authority without credentials
+4. Rate bias on 0–10 scale:
+   0-2 = mostly factual | 3-4 = some exaggeration | 5-6 = significant misleading claims | 7-8 = systematic misinformation | 9-10 = deliberate deception
+5. Write a YouTube comment under 280 characters that is firm, factual, and cites one key fact
+
+Output ONLY valid JSON — no markdown fencing, no text before or after:
 {
   "verdict": "accurate|misleading|false|unverifiable",
   "bias_score": 0,
@@ -57,83 +104,88 @@ Output ONLY valid JSON — no markdown fencing, no explanation before or after:
     {
       "quote": "exact words from transcript",
       "verdict": "supported|disputed|false|exaggerated",
-      "explanation": "why, citing evidence",
-      "evidence_urls": ["https://..."]
+      "explanation": "why, with evidence reference",
+      "evidence_urls": ["url from the provided web results"]
     }
   ],
   "comment": "under 280 chars, factual, one key citation",
   "rephrased_variants": [
     "direct version — states the fact plainly",
-    "polite version — asks a question",
-    "brief version — one punchy sentence"
+    "polite version — softer tone, same facts",
+    "question version — asks a pointed question"
   ],
   "sources": [
     { "url": "https://...", "title": "Source title", "relevance": "one sentence" }
   ],
-  "summary": "2 sentences max — plain English verdict for the sidebar UI"
+  "summary": "2 sentences max — plain English verdict for the UI"
 }`;
 
+// ── Main analysis function ────────────────────────────────────────────────────
 export async function analyzeCreator(
   transcripts: { videoId: string; title: string; text: string }[],
   currentVideoTitle: string
 ): Promise<AnalysisResult> {
+  // Step 1: gather web evidence in parallel with prompt construction
+  const webEvidence = await gatherEvidence(transcripts);
+
   const transcriptBlock = transcripts
-    .map((t, i) => `=== VIDEO ${i + 1}: "${t.title}" ===\n${t.text.slice(0, 3000)}`)
+    .map((t, i) => `=== VIDEO ${i + 1}: "${t.title}" ===\n${t.text.slice(0, 2500)}`)
     .join("\n\n");
 
   const userMessage = `Analyze these ${transcripts.length} videos from the same YouTube creator.
-The user is currently watching: "${currentVideoTitle}"
+Currently watching: "${currentVideoTitle}"
 
+WEB EVIDENCE (use URLs from here when citing sources):
+${webEvidence}
+
+TRANSCRIPTS:
 ${transcriptBlock}
 
-Focus your comment on the current video. Use the other ${transcripts.length - 1} videos only to detect contradictions and patterns.
-Use web_search to verify the top 3 most impactful claims before writing your verdict.
+Focus your comment on the current video. Use the other ${transcripts.length - 1} videos to detect patterns and contradictions. Use the web evidence above to verify claims.
 Return ONLY the JSON object.`;
 
-  const response = await client.messages.create({
-    model: "claude-sonnet-4-20250514",
+  // Step 2: call Groq
+  const completion = await groq.chat.completions.create({
+    model: MODEL,
+    temperature: 0.2,  // low temp for factual consistency
     max_tokens: 1500,
-    system: SYSTEM_PROMPT,
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    tools: [{ type: "web_search_20250305", name: "web_search" } as any],
-    messages: [{ role: "user", content: userMessage }],
+    messages: [
+      { role: "system", content: SYSTEM_PROMPT },
+      { role: "user", content: userMessage },
+    ],
   });
 
-  const text = response.content
-    .filter((b): b is Anthropic.TextBlock => b.type === "text")
-    .map((b: Anthropic.TextBlock) => b.text)
-    .join("");
+  const raw = completion.choices[0]?.message?.content ?? "{}";
+  const clean = raw.replace(/```json|```/g, "").trim();
 
-  const clean = text.replace(/```json|```/g, "").trim();
   const parsed = JSON.parse(clean) as AnalysisResult;
   parsed.videos_analyzed = transcripts.length;
   return parsed;
 }
 
+// ── Rephrase function ─────────────────────────────────────────────────────────
 export async function rephraseComment(
   original: string,
   feedback: string
 ): Promise<string[]> {
-  const response = await client.messages.create({
-    model: "claude-sonnet-4-20250514",
+  const completion = await groq.chat.completions.create({
+    model: MODEL,
+    temperature: 0.7,
     max_tokens: 400,
     messages: [
       {
         role: "user",
-        content: `Rephrase this YouTube fact-checking comment 3 ways.
+        content: `Rephrase this YouTube fact-checking comment in 3 ways.
 User feedback: "${feedback}"
 Original: "${original}"
 
-Rules: keep all facts, each under 280 chars, vary the tone (direct / polite / question).
-Return ONLY a JSON array of 3 strings.`,
+Rules: keep all facts, each version under 280 chars, vary the tone (direct / polite / question).
+Return ONLY a JSON array of 3 strings, nothing else.`,
       },
     ],
   });
 
-  const text = response.content
-    .filter((b): b is Anthropic.TextBlock => b.type === "text")
-    .map((b: Anthropic.TextBlock) => b.text)
-    .join("");
-
-  return JSON.parse(text.replace(/```json|```/g, "").trim()) as string[];
+  const raw = completion.choices[0]?.message?.content ?? "[]";
+  const clean = raw.replace(/```json|```/g, "").trim();
+  return JSON.parse(clean) as string[];
 }
